@@ -1,0 +1,118 @@
+name: Build TrollCleaner IPA
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'Sources/**'
+      - 'Resources/**'
+      - 'project.yml'
+      - 'TrollCleaner.entitlements'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build .app (unsigned)
+        run: |
+          xcodebuild \
+            -project TrollCleaner.xcodeproj \
+            -scheme TrollCleaner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -quiet
+
+      - name: Create self-signed code signing certificate
+        run: |
+          set -e
+          # Temp keychain
+          KEYCHAIN_PASS="temp"
+          KEYCHAIN=~/Library/Keychains/trollcleaner.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security list-keychains -s "$KEYCHAIN"
+
+          # Generate self-signed certificate with proper code signing extended key usage
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/cert-key.pem \
+            -out /tmp/cert.pem -days 365 -nodes \
+            -subj "/CN=TrollCleaner Dev/O=TrollCleaner/OU=Signing" \
+            -addext "keyUsage=digitalSignature" \
+            -addext "extendedKeyUsage=codeSigning"
+
+          # Bundle as PKCS12
+          openssl pkcs12 -export -out /tmp/cert.p12 \
+            -inkey /tmp/cert-key.pem -in /tmp/cert.pem \
+            -passout pass:"$KEYCHAIN_PASS" -name "TrollCleaner Dev"
+
+          # Import to keychain
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$KEYCHAIN_PASS"
+
+          # Allow codesign to access keychain without prompt
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          echo "--- Available identities ---"
+          security find-identity -v -p codesigning "$KEYCHAIN" | head -10
+
+      - name: Sign with self-signed cert + inject entitlements
+        run: |
+          APP=build/Build/Products/Release-iphoneos/TrollCleaner.app
+          IDENTITY="TrollCleaner Dev"
+
+          echo "--- Before signing (no signatures expected) ---"
+          codesign -dv "$APP" 2>&1 || true
+
+          echo "--- Signing with $IDENTITY ---"
+          codesign \
+            --force \
+            --sign "$IDENTITY" \
+            --entitlements TrollCleaner.entitlements \
+            --generate-ent-der \
+            --verbose \
+            "$APP"
+
+          echo ""
+          echo "--- Embedded entitlements (verify) ---"
+          codesign --display --entitlements :- "$APP" 2>&1
+
+          echo ""
+          echo "--- Signature info ---"
+          codesign -dv "$APP" 2>&1
+
+      - name: Create IPA payload
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/TrollCleaner.app Payload/
+          zip -r TrollCleaner.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollCleaner.ipa
+          path: TrollCleaner.ipa
+          compression-level: 0
+
+      - name: Upload .app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollCleaner.app
+          path: build/Build/Products/Release-iphoneos/TrollCleaner.app
+          compression-level: 0
