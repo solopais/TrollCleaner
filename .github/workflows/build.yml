@@ -85,7 +85,6 @@ jobs:
             --force \
             --sign "$IDENTITY" \
             --entitlements TrollCleaner.entitlements \
-            --generate-ent-der \
             --verbose \
             "$APP"
 
